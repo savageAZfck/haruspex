@@ -13,6 +13,7 @@
 //! update actually change" is an answerable question.
 
 pub mod cache;
+pub mod code;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -111,6 +112,8 @@ pub struct OffString {
 pub struct Section {
     pub segname: String,
     pub sectname: String,
+    /// Load address (preserved even for cache-carved images).
+    pub addr: u64,
     pub size: u64,
     pub fileoff: u64,
 }
@@ -146,6 +149,14 @@ pub struct Slice {
     pub objc_classes: Vec<String>,
     /// ObjC selector names from __objc_methname — the SPI surface.
     pub objc_selectors: Vec<String>,
+    /// Preferred load address (vmaddr of the first file-backed
+    /// segment — the Mach-O header itself).
+    pub image_base: u64,
+    /// `LC_FUNCTION_STARTS` (off, size). In cache-carved images these
+    /// offsets index the shared linkedit subcache, not this file.
+    pub function_starts: Option<(u32, u32)>,
+    /// `LC_DYLD_EXPORTS_TRIE` (off, size). Same linkedit caveat.
+    pub exports_trie: Option<(u32, u32)>,
 }
 
 /// Full container parse: thin binaries have one slice, fat have several.
@@ -153,6 +164,22 @@ pub struct Slice {
 pub struct MachO {
     pub fat: bool,
     pub slices: Vec<Slice>,
+}
+
+impl Slice {
+    /// The `__text` section, if this slice has code.
+    pub fn text(&self) -> Option<&Section> {
+        self.sections.iter().find(|s| s.sectname == "__text")
+    }
+
+    /// Map a file offset to the vmaddr it is loaded at, using the
+    /// containing section's `addr`/`fileoff` pair.
+    pub fn vmaddr_of_fileoff(&self, off: u64) -> Option<u64> {
+        self.sections
+            .iter()
+            .find(|s| s.fileoff <= off && off < s.fileoff + s.size)
+            .map(|s| s.addr + (off - s.fileoff))
+    }
 }
 
 // ─────────────────────────────── magics ─────────────────────────────
@@ -179,6 +206,8 @@ const LC_VERSION_MIN_MACOSX: u32 = 0x24;
 const LC_VERSION_MIN_IPHONEOS: u32 = 0x25;
 const LC_MAIN: u32 = 0x28 | LC_REQ_DYLD;
 const LC_BUILD_VERSION: u32 = 0x32;
+const LC_FUNCTION_STARTS: u32 = 0x26;
+const LC_DYLD_EXPORTS_TRIE: u32 = 0x33 | LC_REQ_DYLD;
 const LC_RPATH: u32 = 0x1c | LC_REQ_DYLD;
 const LC_LOAD_WEAK_DYLIB: u32 = 0x18 | LC_REQ_DYLD;
 const LC_REEXPORT_DYLIB: u32 = 0x1f | LC_REQ_DYLD;
@@ -315,16 +344,21 @@ fn parse_slice(bytes: &[u8], base: usize, little: bool) -> Result<Slice> {
         match cmd {
             LC_SEGMENT_64 => {
                 let segname = rd.cstr(off + 8, 16)?;
+                let vmaddr = rd.u64(off + 24)?;
                 let fileoff = rd.u64(off + 40)?;
                 let filesize = rd.u64(off + 48)?;
                 let nsects = rd.u32(off + 64)? as usize;
                 // Only record real file-backed content.
                 if filesize > 0 && segname != "__PAGEZERO" {
+                    if s.image_base == 0 {
+                        s.image_base = vmaddr;
+                    }
                     let mut sec_off = off + 72;
                     for _ in 0..nsects {
                         s.sections.push(Section {
                             sectname: rd.cstr(sec_off, 16)?,
                             segname: rd.cstr(sec_off + 16, 16)?,
+                            addr: rd.u64(sec_off + 32)?,
                             size: rd.u64(sec_off + 40)?,
                             fileoff: rd.u32(sec_off + 48)? as u64,
                         });
@@ -366,6 +400,12 @@ fn parse_slice(bytes: &[u8], base: usize, little: bool) -> Result<Slice> {
             LC_CODE_SIGNATURE => {
                 cs = Some((rd.u32(off + 8)?, rd.u32(off + 12)?));
                 s.code_signed = true;
+            }
+            LC_FUNCTION_STARTS => {
+                s.function_starts = Some((rd.u32(off + 8)?, rd.u32(off + 12)?));
+            }
+            LC_DYLD_EXPORTS_TRIE => {
+                s.exports_trie = Some((rd.u32(off + 8)?, rd.u32(off + 12)?));
             }
             LC_VERSION_MIN_MACOSX | LC_VERSION_MIN_IPHONEOS => {
                 s.platform = Some(

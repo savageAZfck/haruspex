@@ -91,6 +91,10 @@ impl CacheFile {
 pub struct SharedCache {
     files: Vec<CacheFile>,
     mappings: Vec<Mapping>,
+    /// Suffix → index into `files` for the non-numbered subcaches
+    /// (".dyldlinkedit", ".dylddata", ".dyldreadonly"). LC_DYLD_INFO-*
+    /// offsets in carved images index raw file offsets inside these.
+    aux: std::collections::HashMap<String, usize>,
     pub images: Vec<Image>,
 }
 
@@ -125,6 +129,7 @@ impl SharedCache {
 
         let mut files: Vec<CacheFile> = Vec::new();
         let mut mappings = Vec::new();
+        let mut aux = std::collections::HashMap::new();
 
         for name in names {
             let file = File::open(&name)?;
@@ -138,6 +143,15 @@ impl SharedCache {
             }
             let idx = files.len();
             let cf = CacheFile { file };
+            for suffix in [".dyldlinkedit", ".dylddata", ".dyldreadonly"] {
+                if name
+                    .file_name()
+                    .map(|n| n.to_string_lossy().ends_with(suffix))
+                    .unwrap_or(false)
+                {
+                    aux.insert(suffix[1..].to_string(), idx);
+                }
+            }
             for (addr, size, off, prot) in read_mappings(&cf, &head)? {
                 mappings.push(Mapping {
                     addr,
@@ -155,8 +169,55 @@ impl SharedCache {
         Ok(SharedCache {
             files,
             mappings,
+            aux,
             images: Vec::new(),
         })
+    }
+
+    /// Raw read inside an aux subcache (".dyldlinkedit" etc.) at a file
+    /// offset — this is where `LC_DYLD_EXPORTS_TRIE`,
+    /// `LC_FUNCTION_STARTS`, `LC_DYLD_INFO` payloads of carved images
+    /// actually live.
+    pub fn aux_read(&self, which: &str, off: u64, n: usize) -> Result<Vec<u8>> {
+        let idx = *self
+            .aux
+            .get(which)
+            .ok_or(Error::Malformed("aux subcache not present"))?;
+        self.files[idx].read(off, n)
+    }
+
+    /// Carve an image and build its full code index: function
+    /// boundaries from `LC_FUNCTION_STARTS`, names from the export trie
+    /// (both read out of the shared linkedit), plus every PC-relative
+    /// xref in `__text`.
+    pub fn code_index(&mut self, needle: &str) -> Result<(String, crate::code::CodeIndex)> {
+        let (name, bytes) = self.extract(needle)?;
+        let m = crate::parse(&bytes)?;
+        let slice = m
+            .slices
+            .first()
+            .ok_or(Error::Malformed("carved image has no slice"))?;
+        // LC offsets index the shared linkedit file; if it is absent
+        // (older caches) fall back to reading the carved image itself.
+        let le = match self.aux.get("dyldlinkedit") {
+            Some(&i) => Some(self.files[i].file.try_clone()?),
+            None => None,
+        };
+        let carved = le.is_none().then_some(bytes.clone());
+        let idx = crate::code::index_code(&bytes, slice, move |off, len| {
+            if let Some(f) = &le {
+                let mut b = vec![0u8; len as usize];
+                f.read_exact_at(&mut b, off)?;
+                return Ok(b);
+            }
+            let (lo, hi) = (off as usize, off as usize + len as usize);
+            carved
+                .as_deref()
+                .and_then(|c| c.get(lo..hi))
+                .map(|s| s.to_vec())
+                .ok_or(Error::Malformed("linkedit range outside image"))
+        })?;
+        Ok((name, idx))
     }
 
     /// Walk every executable mapping looking for page-aligned Mach-O
@@ -306,7 +367,6 @@ impl SharedCache {
         // need patching, all keyed to positions inside `cmds`.
         struct Seg {
             vmaddr: u64,
-            fileoff: u64,
             filesize: u64,
             cmd_at: usize,        // offset of this LC_SEGMENT_64 inside cmds
             sect_ats: Vec<usize>, // offsets of each section_64 inside cmds
@@ -334,7 +394,6 @@ impl SharedCache {
                         }
                         segs.push(Seg {
                             vmaddr: le64(&cmds, off + 24)?,
-                            fileoff: le64(&cmds, off + 40)?,
                             filesize: le64(&cmds, off + 48)?,
                             cmd_at: off,
                             sect_ats,

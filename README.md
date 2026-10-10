@@ -8,6 +8,14 @@ linked dylibs, symbol tables, embedded entitlements, and strings —
 no `otool`, no `nm`, no external process, and the target is never
 executed.
 
+`code` goes deeper: it disassembles `__text` with bad64, scans the raw
+AArch64 encoding for `ADRP`+`ADD`/`LDR` pairs, literal loads and
+branches — over a million xrefs inside ANECompiler — and rebuilds the
+function table from `LC_FUNCTION_STARTS` plus the export trie (offsets
+index the shared `.dyldlinkedit` subcache). That turns "a string exists"
+into "this function at this address emits it": the organ can answer
+*which check fires an error* with a disassembly, not a guess.
+
 `cache` goes further: it opens the split dyld shared cache
 (`/System/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e`
 on Darwin 27), scans executable mappings for page-aligned Mach-O

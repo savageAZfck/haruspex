@@ -36,6 +36,24 @@ Mach-O inspection for Apple platforms. PE/ELF are out of scope in v0.1.
   empty on cache-carved binaries. Strings, sections and load commands
   are complete.
 
+## Code analysis (v0.3)
+
+- `scan_xrefs` decodes the AArch64 encoding directly: `ADRP`+`ADD`
+  pointers, `ADRP`+`LDR`/`STR` memory refs, `LDR` literal, `B`/`BL`
+  edges. No FFI on this path.
+- `function_starts` decodes the `LC_FUNCTION_STARTS` ULEB128 delta
+  table into function boundaries.
+- `export_trie` walks `LC_DYLD_EXPORTS_TRIE` for named symbols;
+  un-named functions are labelled `sub_<addr>`.
+- `index_code` ties them together per-slice; `SharedCache::code_index`
+  resolves the linkedit offsets into `.dyldlinkedit` automatically.
+- `disasm_listing` renders instructions through bad64 (vendored C
+  decoder, MIT — build-time only, no runtime dependency).
+- Verified on ANECompiler: 122,829 functions, 140 exports, 1,162,369
+  xrefs; the "exceeds the bss limit" check resolved to a single site —
+  `ldr x8, [x19, #0x2e8]; cmn x8, #1; ccmp x24, x8, #4, ne` — showing
+  the limit is a context field where -1 means unlimited.
+
 ## Non-goals
 
 - Disassembly / decompilation (that is Ghidra/Hopper territory).
