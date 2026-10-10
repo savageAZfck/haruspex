@@ -8,6 +8,15 @@ linked dylibs, symbol tables, embedded entitlements, and strings —
 no `otool`, no `nm`, no external process, and the target is never
 executed.
 
+`cache` goes further: it opens the split dyld shared cache
+(`/System/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e`
+on Darwin 27), scans executable mappings for page-aligned Mach-O
+headers instead of trusting Apple's index format, and rebuilds any
+image — private frameworks included — into a self-consistent file by
+repacking segments and remapping every file offset. That is how the
+organism reads `ANECompiler`, `MIL`, and the rest of the private
+stack that ships no on-disk binary.
+
 Built as the reverse-engineering organ of
 [Bad Apple](https://github.com/savageAZfck/Bad_Apple) — the part of a
 sovereign agent that can see inside the machine it lives on.

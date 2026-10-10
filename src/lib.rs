@@ -12,6 +12,8 @@
 //! sensitive-API imports); `diff` compares two reports so "what did this
 //! update actually change" is an answerable question.
 
+pub mod cache;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -142,6 +144,8 @@ pub struct Slice {
     pub stack_executable: bool,
     /// ObjC class names from __objc_classname.
     pub objc_classes: Vec<String>,
+    /// ObjC selector names from __objc_methname — the SPI surface.
+    pub objc_selectors: Vec<String>,
 }
 
 /// Full container parse: thin binaries have one slice, fat have several.
@@ -322,7 +326,7 @@ fn parse_slice(bytes: &[u8], base: usize, little: bool) -> Result<Slice> {
                             sectname: rd.cstr(sec_off, 16)?,
                             segname: rd.cstr(sec_off + 16, 16)?,
                             size: rd.u64(sec_off + 40)?,
-                            fileoff: rd.u64(sec_off + 48)?,
+                            fileoff: rd.u32(sec_off + 48)? as u64,
                         });
                         sec_off += 80;
                     }
@@ -392,7 +396,7 @@ fn parse_slice(bytes: &[u8], base: usize, little: bool) -> Result<Slice> {
         s.entitlements = read_entitlements(&rd, csoff as usize, cssize as usize);
     }
 
-    // ObjC class names live as a table of C strings in __objc_classname.
+    // ObjC metadata lives as tables of C strings in dedicated sections.
     for sec in &s.sections {
         if sec.sectname == "__objc_classname" {
             for os in ascii_strings(
@@ -401,6 +405,14 @@ fn parse_slice(bytes: &[u8], base: usize, little: bool) -> Result<Slice> {
                 sec.fileoff,
             ) {
                 s.objc_classes.push(os.text);
+            }
+        } else if sec.sectname == "__objc_methname" {
+            for os in ascii_strings(
+                &rd.at(sec.fileoff as usize, sec.size as usize)?,
+                2,
+                sec.fileoff,
+            ) {
+                s.objc_selectors.push(os.text);
             }
         }
     }
@@ -901,5 +913,39 @@ impl Report {
     /// True when every slice carries LC_CODE_SIGNATURE.
     pub fn code_signed_all(&self) -> bool {
         self.slices.iter().all(|s| s.code_signed)
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod cache_tests {
+    use super::cache::SharedCache;
+    use super::parse;
+    use std::path::Path;
+
+    const CACHE: &str = "/System/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e";
+
+    /// Only runs where a Darwin 27-style cryptex cache exists.
+    #[test]
+    fn carves_libsystem_from_live_cache() {
+        let path = Path::new(CACHE);
+        if !path.exists() {
+            eprintln!("no cryptex cache here — skipping");
+            return;
+        }
+        let mut c = SharedCache::open(path).unwrap();
+        c.enumerate_images().unwrap();
+        assert!(c.images.len() > 100, "expected a full cache index");
+        let (name, bytes) = c.extract("libsystem_c.dylib").unwrap();
+        assert!(name.contains("libsystem_c"));
+        let m = parse(&bytes).unwrap();
+        assert!(!m.slices.is_empty());
+        // Zerofill sections legitimately offset past EOF — check the
+        // file-backed string sections instead.
+        let cstr = m.slices[0]
+            .sections
+            .iter()
+            .find(|s| s.sectname == "__cstring")
+            .expect("libsystem_c has __cstring");
+        assert!((cstr.fileoff + cstr.size) as usize <= bytes.len());
     }
 }
